@@ -489,7 +489,7 @@ const INITIAL_BOTS = [{
   ringColor: 'ring-blue-400/50',
   dotColor: 'bg-[#0080FF] shadow-[0_0_8px_#0080FF]',
   badge: 'DS',
-  targetUrl: 'https://chat.deepseek.com/a/chat/s/98f2a1c4-7b11-4d9a',
+  targetUrl: 'https://chat.deepseek.com/',
   selectorInput: '#chat-input',
   selectorSend: 'div[role="button"].ds-send-btn',
   status: 'connected',
@@ -505,7 +505,7 @@ const INITIAL_BOTS = [{
   ringColor: 'ring-emerald-400/50',
   dotColor: 'bg-[#10A37F] shadow-[0_0_8px_#10A37F]',
   badge: '4o',
-  targetUrl: 'https://chatgpt.com/c/6724a8f0-12a4-800c-99b1',
+  targetUrl: 'https://chatgpt.com/',
   selectorInput: '#prompt-textarea',
   selectorSend: 'button[data-testid="send-button"]',
   status: 'connected',
@@ -521,7 +521,7 @@ const INITIAL_BOTS = [{
   ringColor: 'ring-fuchsia-400/50',
   dotColor: 'bg-[#D946EF] shadow-[0_0_8px_#D946EF]',
   badge: 'Ki',
-  targetUrl: 'https://kimi.moonshot.cn/chat/csu98712kjas812',
+  targetUrl: 'https://www.kimi.com/',
   selectorInput: 'div[contenteditable="true"].chat-input',
   selectorSend: 'button.send-button',
   status: 'connected',
@@ -537,7 +537,7 @@ const INITIAL_BOTS = [{
   ringColor: 'ring-orange-400/50',
   dotColor: 'bg-[#F97316] shadow-[0_0_8px_#F97316]',
   badge: 'CL',
-  targetUrl: 'https://claude.ai/chat/8b91c3d2-4410-91a2',
+  targetUrl: 'https://claude.ai/new',
   selectorInput: 'div.ProseMirror[contenteditable="true"]',
   selectorSend: 'button[aria-label="Send Message"]',
   status: 'connected',
@@ -1330,9 +1330,24 @@ function findMentionedBots(text, bots) {
 const WEB_H_STATE_KEY = 'web_h_state_v1';
 const WEB_H_DB_NAME = 'web_h_userdata';
 const WEB_H_DB_STORE = 'app_state';
+function migrateSavedAppState(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.bots)) return snapshot;
+  const legacyTargets = {
+    deepseek: ['https://chat.deepseek.com/a/chat/s/98f2a1c4-7b11-4d9a', 'https://chat.deepseek.com/'],
+    chatgpt: ['https://chatgpt.com/c/6724a8f0-12a4-800c-99b1', 'https://chatgpt.com/']
+  };
+  let changed = false;
+  const bots = snapshot.bots.map(bot => {
+    const pair = legacyTargets[bot?.id];
+    if (!pair || bot.targetUrl !== pair[0]) return bot;
+    changed = true;
+    return { ...bot, targetUrl: pair[1] };
+  });
+  return changed ? { ...snapshot, bots } : snapshot;
+}
 function readLocalAppState() {
   try {
-    return JSON.parse(window.localStorage.getItem(WEB_H_STATE_KEY) || 'null');
+    return migrateSavedAppState(JSON.parse(window.localStorage.getItem(WEB_H_STATE_KEY) || 'null'));
   } catch {
     return null;
   }
@@ -1352,7 +1367,7 @@ async function readIndexedAppState() {
     const request = db.transaction(WEB_H_DB_STORE, 'readonly').objectStore(WEB_H_DB_STORE).get('current');
     request.onsuccess = () => {
       db.close();
-      resolve(request.result || null);
+      resolve(migrateSavedAppState(request.result || null));
     };
     request.onerror = () => {
       db.close();
@@ -1394,6 +1409,7 @@ function App() {
   const messages = groupMessages[activeGroupId] || [];
   const [inputText, setInputText] = useState('');
   const [pendingAttachments, setPendingAttachments] = useState([]);
+  const attachmentFilesRef = useRef(new Map());
   const [groupEditorOpen, setGroupEditorOpen] = useState(false);
   const [groupDraft, setGroupDraft] = useState({
     id: null,
@@ -2446,6 +2462,7 @@ function App() {
           action: 'SEND_TO_TAB',
           requestId,
           botId: bot.id,
+          platform: bot.platform || '',
           targetUrl: bot.targetUrl,
           selectorInput: bot.selectorInput,
           selectorSend: bot.selectorSend,
@@ -3173,6 +3190,81 @@ function App() {
     const fallbackPool = Array.isArray(bot.SampleReplies) && bot.SampleReplies.length ? bot.SampleReplies : [`已在应用内嵌网页中收到「${cleanTopic}」，这是通过移动端内置 WebView 桥接返回的实时回复。`];
     return fallbackPool[turnSeed % fallbackPool.length];
   };
+  const stageAndroidCommandAttachments = async command => {
+    const bridge = window.AndroidWebHBridge;
+    const attachments = Array.isArray(command.attachments) ? command.attachments : [];
+    if (!attachments.length) return [];
+    if (!bridge || typeof bridge.beginAttachmentUpload !== 'function' || typeof bridge.writeAttachmentChunk !== 'function' || typeof bridge.finishAttachmentUpload !== 'function') {
+      throw new Error('此 APK 没有可用的本机文件传输通道，请安装本次修复版');
+    }
+    const staged = [];
+    const createdNativeIds = [];
+    try {
+      for (let index = 0; index < attachments.length; index += 1) {
+        const item = attachments[index];
+        let file = attachmentFilesRef.current.get(item.id);
+        if (!file && item.url) {
+          try {
+            const response = await fetch(item.url);
+            if (response.ok) {
+              const blob = await response.blob();
+              file = new File([blob], item.name || '附件', { type: blob.type || item.type || 'application/octet-stream' });
+            }
+          } catch (_error) {}
+        }
+        if (!file || typeof file.slice !== 'function') throw new Error(`找不到「${item.name || '附件'}」的原始文件，请重新选择后发送`);
+        if (!file.size || file.size > 100 * 1024 * 1024) throw new Error(`「${file.name || item.name || '附件'}」为空或超过 100 MB`);
+        const nativeId = `wh_${String(command.requestId || Date.now()).replace(/[^A-Za-z0-9_-]/g, '_')}_${index}_${Math.random().toString(36).slice(2, 8)}`;
+        if (!bridge.beginAttachmentUpload(nativeId, file.size)) throw new Error(`手机无法为「${file.name}」准备临时文件；请检查剩余存储空间`);
+        createdNativeIds.push(nativeId);
+        for (let offset = 0; offset < file.size; offset += 48 * 1024) {
+          const bytes = new Uint8Array(await file.slice(offset, Math.min(file.size, offset + 48 * 1024)).arrayBuffer());
+          let binary = '';
+          for (let cursor = 0; cursor < bytes.length; cursor += 0x8000) binary += String.fromCharCode(...bytes.subarray(cursor, Math.min(bytes.length, cursor + 0x8000)));
+          if (!bridge.writeAttachmentChunk(nativeId, btoa(binary))) throw new Error(`「${file.name}」传到手机时中断，请重试`);
+        }
+        if (!bridge.finishAttachmentUpload(nativeId)) throw new Error(`「${file.name}」临时文件校验失败，请重新选择`);
+        staged.push({ attachmentId: nativeId, name: file.name || item.name || '附件', type: file.type || item.type || 'application/octet-stream', size: file.size });
+      }
+      return staged;
+    } catch (error) {
+      createdNativeIds.forEach(id => bridge.discardAttachment?.(id));
+      throw error;
+    }
+  };
+  const hydrateAndroidReplyAttachments = async attachments => {
+    const bridge = window.AndroidWebHBridge;
+    const items = Array.isArray(attachments) ? attachments : [];
+    const failures = [];
+    const hydrated = await Promise.all(items.map(async item => {
+      const id = item?.attachmentId;
+      if (!id || !bridge || typeof bridge.readReplyAttachmentChunk !== 'function') return item;
+      try {
+        const size = Number(item.size || 0);
+        if (!Number.isFinite(size) || size < 1 || size > 100 * 1024 * 1024) throw new Error('文件为空或超过 100 MB');
+        const chunks = [];
+        for (let offset = 0; offset < size;) {
+          const encoded = bridge.readReplyAttachmentChunk(id, offset, 48 * 1024);
+          if (!encoded) throw new Error(`读取在 ${offset}/${size} 字节处中断`);
+          const binary = atob(encoded);
+          const bytes = new Uint8Array(binary.length);
+          for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+          chunks.push(bytes);
+          offset += bytes.length;
+        }
+        const type = item.type || 'application/octet-stream';
+        const url = URL.createObjectURL(new Blob(chunks, { type }));
+        bridge.discardReplyAttachment?.(id);
+        return { ...item, id: item.id || `webh-reply-${id}`, url, size, ephemeralInMemoryOnly: true };
+      } catch (error) {
+        failures.push(`${item.name || 'AI 附件'}：${error?.message || String(error)}`);
+        bridge.discardReplyAttachment?.(id);
+        return null;
+      }
+    }));
+    if (failures.length) showToast(`AI 回复已收到；部分附件无法载入：${failures.join('；')}`);
+    return hydrated.filter(Boolean);
+  };
   const connectLocalBridge = (silent = false) => {
     // 模式 A：手机端最佳连接方式 —— 应用内嵌多标签 WebView 内存直连桥 (In-App WebView JS Bridge)
     if (bridgeTransportModeRef.current === 'in-app-webview') {
@@ -3258,15 +3350,40 @@ function App() {
               }
             };
           });
-          if (window.AndroidWebHBridge && typeof window.AndroidWebHBridge.postCommand === 'function' && webViewRenderModeRef.current === 'native-iframe') {
-            try {
-              window.AndroidWebHBridge.postCommand(JSON.stringify({
-                ...command,
-                targetUrl: strictBoundUrl,
-                strictUrlMatch: true
+          if (webViewRenderModeRef.current === 'native-iframe') {
+            if (!window.AndroidWebHBridge || typeof window.AndroidWebHBridge.postCommand !== 'function') {
+              window.__onAndroidBridgeEvent?.(JSON.stringify({
+                type: 'BOT_ERROR', botId, groupId: command.groupId, requestId: command.requestId,
+                syncThrough: command.syncThrough, message: '当前运行环境未连接 Android 原生网页桥；没有把这条消息伪装成 AI 回复'
               }));
               return;
-            } catch (_err) {}
+            }
+            void (async () => {
+              try {
+                const stagedAttachments = await stageAndroidCommandAttachments(command);
+                if (command.requestId && cancelledRequestIdsRef.current.has(command.requestId)) {
+                  stagedAttachments.forEach(item => window.AndroidWebHBridge.discardAttachment?.(item.attachmentId));
+                  return;
+                }
+                window.AndroidWebHBridge.postCommand(JSON.stringify({
+                  ...command,
+                  targetUrl: strictBoundUrl,
+                  platform: bot.platform || '',
+                  attachments: stagedAttachments,
+                  strictUrlMatch: true
+                }));
+              } catch (error) {
+                setInAppBrowserTabs(previous => previous[botId] ? {
+                  ...previous,
+                  [botId]: { ...previous[botId], isGenerating: false }
+                } : previous);
+                window.__onAndroidBridgeEvent?.(JSON.stringify({
+                  type: 'BOT_ERROR', botId, groupId: command.groupId, requestId: command.requestId,
+                  syncThrough: command.syncThrough, message: error?.message || String(error)
+                }));
+              }
+            })();
+            return;
           }
 
           // 2. 280ms 后点击内嵌网页发送按钮，将增量包写入内嵌网页对话流，并开始流式吐字
@@ -3757,6 +3874,19 @@ function App() {
 
       // 挂载全局回调，供 Android 原生 MainActivity.kt evaluateJavascript 回传事件
       window.__onAndroidBridgeEvent = rawJsonString => {
+        try {
+          const payload = JSON.parse(rawJsonString);
+          const mediaWarnings = Array.isArray(payload.attachments) ? payload.attachments.filter(item => item?.transferError) : [];
+          if (payload.type === 'BOT_REPLY' && mediaWarnings.length) {
+            showToast(`AI 文字回复已收到；部分媒体无法载入：${mediaWarnings.map(item => item.name || '附件').join('、')}`);
+          }
+          if (payload.type === 'BOT_REPLY' && Array.isArray(payload.attachments) && payload.attachments.some(item => item?.attachmentId)) {
+            void hydrateAndroidReplyAttachments(payload.attachments).then(attachments => {
+              ws.onmessage?.({ data: JSON.stringify({ ...payload, attachments }) });
+            });
+            return;
+          }
+        } catch (_error) {}
         ws.onmessage?.({
           data: rawJsonString
         });
@@ -4394,8 +4524,10 @@ function App() {
     const valid = files.map((file, idx) => {
       const rawType = file.type || (/\.(jpg|jpeg|png|gif|webp|bmp|svg)$/i.test(file.name) ? 'image/png' : /\.(mp4|webm|mov|mkv|avi)$/i.test(file.name) ? 'video/mp4' : 'application/octet-stream');
       const blobUrl = typeof URL !== 'undefined' && URL.createObjectURL ? URL.createObjectURL(file) : '';
+      const id = `file-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 7)}`;
+      attachmentFilesRef.current.set(id, file);
       return {
-        id: `file-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 7)}`,
+        id,
         name: file.name || `附件_${idx + 1}`,
         type: rawType,
         size: file.size || 0,
@@ -4404,7 +4536,7 @@ function App() {
       };
     });
     setPendingAttachments(previous => [...previous, ...valid]);
-    showToast(`已添加 ${valid.length} 个附件（支持图片/视频/任意文件，纯内存加载不占手机存储）`);
+    showToast(`已添加 ${valid.length} 个附件；发送时会临时缓存，并在网页完成处理后自动清理`);
   };
   const startNewGroup = () => {
     setGroupDraft({
@@ -4518,14 +4650,24 @@ function App() {
         selectorSend: 'div[role="button"].ds-send-btn'
       },
       'Kimi': {
-        targetUrl: 'https://kimi.moonshot.cn/',
+        targetUrl: 'https://www.kimi.com/',
         selectorInput: 'div[contenteditable="true"].chat-input',
         selectorSend: 'button.send-button'
       },
       'Gemini': {
         targetUrl: 'https://gemini.google.com/app',
-        selectorInput: 'div[contenteditable="true"]',
-        selectorSend: 'button[aria-label*="Send"]'
+        selectorInput: 'rich-textarea [contenteditable="true"]',
+        selectorSend: 'button[data-test-id="send-button"]'
+      },
+      '豆包': {
+        targetUrl: 'https://www.doubao.com/chat/',
+        selectorInput: '[contenteditable="true"]',
+        selectorSend: 'button[aria-label*="发送"]'
+      },
+      '千问': {
+        targetUrl: 'https://chat.qwen.ai/',
+        selectorInput: '[contenteditable="true"]',
+        selectorSend: 'button[aria-label*="发送"]'
       },
       '自定义网页 AI': {
         targetUrl: '',
@@ -6159,7 +6301,11 @@ function App() {
   }), /*#__PURE__*/React.createElement("span", {
     className: "max-w-[56px] truncate"
   }, attachment.name)), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setPendingAttachments(previous => previous.filter(item => item.id !== attachment.id)),
+    onClick: () => {
+      attachmentFilesRef.current.delete(attachment.id);
+      if (attachment.url?.startsWith('blob:')) URL.revokeObjectURL(attachment.url);
+      setPendingAttachments(previous => previous.filter(item => item.id !== attachment.id));
+    },
     className: "absolute top-0.5 right-0.5 w-4 h-4 rounded-full bg-black/70 text-white flex items-center justify-center",
     title: "\u79FB\u9664\u9644\u4EF6"
   }, /*#__PURE__*/React.createElement(X, {
@@ -8731,13 +8877,15 @@ function App() {
       const value = event.target.value;
       const template = value.startsWith('copy:') ? bots.find(bot => bot.id === value.slice(5)) : null;
       const providerDefaults = {
-        'ChatGPT': ['#prompt-textarea', 'button[data-testid="send-button"]'],
-        'Claude': ['div.ProseMirror[contenteditable="true"]', 'button[aria-label="Send Message"]'],
-        'DeepSeek': ['#chat-input', 'div[role="button"].ds-send-btn'],
-        'Kimi': ['div[contenteditable="true"].chat-input', 'button.send-button'],
-        'Gemini': ['div[contenteditable="true"]', 'button[aria-label*="Send"]'],
-        '自定义网页 AI': ['div[contenteditable="true"]', 'button[type="submit"]']
-      }[value] || ['div[contenteditable="true"]', 'button[type="submit"]'];
+        'ChatGPT': ['#prompt-textarea', 'button[data-testid="send-button"]', 'https://chatgpt.com/'],
+        'Claude': ['div.ProseMirror[contenteditable="true"]', 'button[aria-label="Send Message"]', 'https://claude.ai/new'],
+        'DeepSeek': ['#chat-input', 'div[role="button"].ds-send-btn', 'https://chat.deepseek.com/'],
+        'Kimi': ['div[contenteditable="true"].chat-input', 'button.send-button', 'https://www.kimi.com/'],
+        'Gemini': ['rich-textarea [contenteditable="true"]', 'button[data-test-id="send-button"]', 'https://gemini.google.com/app'],
+        '豆包': ['[contenteditable="true"]', 'button[aria-label*="发送"]', 'https://www.doubao.com/chat/'],
+        '千问': ['[contenteditable="true"]', 'button[aria-label*="发送"]', 'https://chat.qwen.ai/'],
+        '自定义网页 AI': ['div[contenteditable="true"]', 'button[type="submit"]', '']
+      }[value] || ['div[contenteditable="true"]', 'button[type="submit"]', ''];
       setBotDraft(template ? {
         templateId: template.id,
         name: `${template.name} 新成员`,
@@ -8752,6 +8900,7 @@ function App() {
         ...botDraft,
         templateId: '',
         platform: value,
+        targetUrl: providerDefaults[2],
         selectorInput: providerDefaults[0],
         selectorSend: providerDefaults[1]
       });
@@ -8768,6 +8917,10 @@ function App() {
   }, "Kimi"), /*#__PURE__*/React.createElement("option", {
     value: "Gemini"
   }, "Gemini"), /*#__PURE__*/React.createElement("option", {
+    value: "豆包"
+  }, "豆包"), /*#__PURE__*/React.createElement("option", {
+    value: "千问"
+  }, "千问"), /*#__PURE__*/React.createElement("option", {
     value: "\u81EA\u5B9A\u4E49\u7F51\u9875 AI"
   }, "\u81EA\u5B9A\u4E49\u7F51\u9875 AI"), bots.length > 0 && /*#__PURE__*/React.createElement("optgroup", {
     label: "\u590D\u5236\u73B0\u6709\u804A\u5929\u4EBA"

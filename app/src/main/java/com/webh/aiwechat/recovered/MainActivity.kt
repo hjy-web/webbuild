@@ -4,9 +4,13 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.util.Base64
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.SslErrorHandler
@@ -22,6 +26,10 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import org.json.JSONObject
 import java.util.ArrayDeque
+import java.io.File
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Recovered Web H Android host. The bundled web UI is kept intact; this class fixes
@@ -34,6 +42,12 @@ class MainActivity : ComponentActivity() {
         val groupId: String
     )
 
+    private data class AttachmentUploadSession(
+        val file: File,
+        val expectedSize: Long,
+        var writtenSize: Long = 0L
+    )
+
     private class AiPage(
         val botId: String,
         val webView: WebView,
@@ -44,6 +58,7 @@ class MainActivity : ComponentActivity() {
         var loadFailure: String? = null
         var inFlight: PendingCommand? = null
         val queue = ArrayDeque<PendingCommand>()
+        val activeAttachmentIds: MutableSet<String> = ConcurrentHashMap.newKeySet()
     }
 
     private lateinit var root: FrameLayout
@@ -52,6 +67,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var embeddedBrowserSlot: FrameLayout
     private lateinit var injectorScript: String
     private val aiPages = mutableMapOf<String, AiPage>()
+    private val attachmentUploadSessions = ConcurrentHashMap<String, AttachmentUploadSession>()
+    private val stagedAttachmentFiles = ConcurrentHashMap<String, File>()
     private var activeVisibleBotId: String? = null
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
     private val fileChooserRequestCode = 7314
@@ -59,6 +76,7 @@ class MainActivity : ComponentActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applyImmersiveFullscreen()
         injectorScript = assets.open("web_h_injector.js").bufferedReader().use { it.readText() }
 
         root = FrameLayout(this)
@@ -69,10 +87,19 @@ class MainActivity : ComponentActivity() {
         }
 
         mainWebView = WebView(this).apply {
-            configureSettings(settings)
+            configureSettings(settings, isLocalUi = true)
             addJavascriptInterface(MainUiBridge(), "AndroidWebHBridge")
             webChromeClient = AppWebChromeClient()
-            webViewClient = WebViewClient()
+            webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                    val uri = request?.url ?: return true
+                    if (uri.scheme == "file" && uri.path?.startsWith("/android_asset/www/") == true) return false
+                    if (uri.scheme == "https" || uri.scheme == "http") {
+                        runCatching { startActivity(Intent(Intent.ACTION_VIEW, uri)) }
+                    }
+                    return true
+                }
+            }
             loadUrl("file:///android_asset/www/index.html")
         }
 
@@ -99,34 +126,196 @@ class MainActivity : ComponentActivity() {
         ViewGroup.LayoutParams.MATCH_PARENT
     )
 
+    @Suppress("DEPRECATION")
+    private fun applyImmersiveFullscreen() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode = android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false)
+            window.insetsController?.let { controller ->
+                controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller.hide(WindowInsets.Type.systemBars())
+            }
+        } else {
+            window.decorView.systemUiVisibility = (
+                View.SYSTEM_UI_FLAG_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                )
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) applyImmersiveFullscreen()
+    }
+
+    private fun validAttachmentId(value: String): Boolean =
+        value.length in 8..100 && value.matches(Regex("[A-Za-z0-9_-]+"))
+
+    private fun attachmentIds(rawCommand: String): List<String> {
+        return try {
+            val attachments = JSONObject(rawCommand).optJSONArray("attachments") ?: return emptyList()
+            buildList {
+                for (index in 0 until attachments.length()) {
+                    val id = attachments.optJSONObject(index)?.optString("attachmentId", "") ?: ""
+                    if (validAttachmentId(id)) add(id)
+                }
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun discardAttachment(id: String) {
+        if (!validAttachmentId(id)) return
+        attachmentUploadSessions.remove(id)?.file?.delete()
+        stagedAttachmentFiles.remove(id)?.delete()
+    }
+
+    private fun discardCommandAttachments(rawCommand: String) {
+        attachmentIds(rawCommand).forEach(::discardAttachment)
+    }
+
+    private fun clearActiveAttachments(page: AiPage) {
+        val ids = page.activeAttachmentIds.toList()
+        page.activeAttachmentIds.clear()
+        ids.forEach(::discardAttachment)
+    }
+
+    private fun clearQueuedCommands(page: AiPage) {
+        page.queue.toList().forEach { task -> discardCommandAttachments(task.raw) }
+        page.queue.clear()
+    }
+
+    private fun beginAttachmentUpload(id: String, size: Long): Boolean {
+        if (!validAttachmentId(id) || size !in 1..MAX_ATTACHMENT_BYTES) return false
+        return try {
+            discardAttachment(id)
+            val file = File(cacheDir, "webh-$id.part")
+            file.parentFile?.mkdirs()
+            if (!file.createNewFile()) return false
+            attachmentUploadSessions[id] = AttachmentUploadSession(file, size)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun writeAttachmentChunk(id: String, encodedChunk: String): Boolean {
+        if (!validAttachmentId(id) || encodedChunk.length > MAX_BASE64_CHUNK_CHARS) return false
+        val session = attachmentUploadSessions[id] ?: return false
+        return try {
+            val bytes = Base64.decode(encodedChunk, Base64.NO_WRAP)
+            if (bytes.isEmpty() || bytes.size > MAX_ATTACHMENT_CHUNK_BYTES) return false
+            synchronized(session) {
+                if (session.writtenSize + bytes.size > session.expectedSize) return false
+                FileOutputStream(session.file, true).use { it.write(bytes) }
+                session.writtenSize += bytes.size
+            }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun finishAttachmentUpload(id: String): Boolean {
+        if (!validAttachmentId(id)) return false
+        val session = attachmentUploadSessions[id] ?: return false
+        return try {
+            synchronized(session) {
+                if (session.writtenSize != session.expectedSize) {
+                    discardAttachment(id)
+                    return false
+                }
+                val finalFile = File(cacheDir, "webh-$id.bin")
+                finalFile.delete()
+                if (!session.file.renameTo(finalFile)) {
+                    discardAttachment(id)
+                    return false
+                }
+                attachmentUploadSessions.remove(id, session)
+                stagedAttachmentFiles[id] = finalFile
+            }
+            true
+        } catch (_: Exception) {
+            discardAttachment(id)
+            false
+        }
+    }
+
+    private fun readAttachmentChunk(botId: String, id: String, offset: Long, requestedLength: Int): String {
+        if (!validAttachmentId(id) || offset < 0) return ""
+        val page = aiPages[botId] ?: return ""
+        if (!page.activeAttachmentIds.contains(id)) return ""
+        return readStagedAttachmentChunk(id, offset, requestedLength)
+    }
+
+    private fun readStagedAttachmentChunk(id: String, offset: Long, requestedLength: Int): String {
+        if (!validAttachmentId(id) || offset < 0) return ""
+        val file = stagedAttachmentFiles[id] ?: return ""
+        val remaining = file.length() - offset
+        if (remaining <= 0) return ""
+        val length = minOf(requestedLength.coerceIn(1, MAX_ATTACHMENT_CHUNK_BYTES), remaining.toInt())
+        return try {
+            val bytes = ByteArray(length)
+            RandomAccessFile(file, "r").use { input ->
+                input.seek(offset)
+                input.readFully(bytes)
+            }
+            Base64.encodeToString(bytes, Base64.NO_WRAP)
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    private companion object {
+        const val MAX_ATTACHMENT_BYTES = 100L * 1024L * 1024L
+        const val MAX_ATTACHMENT_CHUNK_BYTES = 48 * 1024
+        const val MAX_BASE64_CHUNK_CHARS = 70 * 1024
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
-    private fun configureSettings(settings: WebSettings) {
+    private fun configureSettings(settings: WebSettings, isLocalUi: Boolean) {
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
         settings.databaseEnabled = true
         settings.mediaPlaybackRequiresUserGesture = false
-        settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-        settings.allowFileAccess = true
+        settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+        settings.allowFileAccess = isLocalUi
+        settings.allowFileAccessFromFileURLs = false
+        settings.allowUniversalAccessFromFileURLs = false
         settings.allowContentAccess = true
         settings.javaScriptCanOpenWindowsAutomatically = true
         settings.setSupportMultipleWindows(true)
         // Keep Android System WebView's real UA; do not claim an unrelated old Chrome/device.
     }
 
-    private fun normalizeUrl(value: String): String = try {
-        Uri.parse(value.trim()).buildUpon().fragment(null).build().toString().trimEnd('/')
-    } catch (_: Exception) {
-        value.trim().trimEnd('/')
+    private fun normalizeUrl(value: String): String {
+        return try {
+            val uri = Uri.parse(value.trim())
+            if (uri.scheme != "https" || uri.host.isNullOrBlank() || !uri.userInfo.isNullOrBlank()) ""
+            else uri.buildUpon().fragment(null).build().toString().trimEnd('/')
+        } catch (_: Exception) {
+            ""
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun getOrCreateAiPage(botId: String, targetUrl: String): AiPage {
         val requestedUrl = targetUrl.trim()
+        if (normalizeUrl(requestedUrl).isBlank()) throw IllegalArgumentException("AI 网页地址必须是有效的 HTTPS 地址")
         val existing = aiPages[botId]
         if (existing != null) {
             if (requestedUrl.isNotBlank() && normalizeUrl(requestedUrl) != normalizeUrl(existing.targetUrl)) {
                 failInFlight(existing, "聊天人的网页地址已更改，旧页面请求已取消")
-                existing.queue.clear()
+                clearQueuedCommands(existing)
                 existing.targetUrl = requestedUrl
                 existing.ready = false
                 existing.installingInjector = false
@@ -138,7 +327,7 @@ class MainActivity : ComponentActivity() {
 
         val webView = WebView(this).apply {
             layoutParams = matchParent()
-            configureSettings(settings)
+            configureSettings(settings, isLocalUi = false)
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
             addJavascriptInterface(AiPageHostBridge(botId), "AndroidWebHHost")
@@ -155,16 +344,20 @@ class MainActivity : ComponentActivity() {
     private fun onAiPageFinished(botId: String, webView: WebView, url: String) {
         val page = aiPages[botId] ?: return
         if (page.webView !== webView) return
-        if (!url.startsWith("http://") && !url.startsWith("https://")) return
+        if (normalizeUrl(url).isBlank()) return
         page.ready = false
         if (page.installingInjector) return
         page.installingInjector = true
-        webView.evaluateJavascript(injectorScript) {
+        webView.evaluateJavascript(injectorScript) { result ->
             runOnUiThread {
                 val current = aiPages[botId]
                 if (current !== page) return@runOnUiThread
                 page.installingInjector = false
-                page.ready = true
+                page.ready = result?.trim() == "true"
+                if (!page.ready) {
+                    failPage(page, "网页连接脚本未能安装；请更新 Android System WebView 后重试")
+                    return@runOnUiThread
+                }
                 CookieManager.getInstance().flush()
                 notifyMainUi(JSONObject().apply {
                     put("type", "WEBVIEW_URL_CHANGED")
@@ -183,14 +376,25 @@ class MainActivity : ComponentActivity() {
         }
         val botId = command.optString("botId", "deepseek").ifBlank { "deepseek" }
         val targetUrl = command.optString("targetUrl", "")
-        if (targetUrl.isBlank()) {
+        if (targetUrl.isBlank() || normalizeUrl(targetUrl).isBlank()) {
             notifyMainUi(errorJson(command, botId, "请先填写该聊天人的网页对话地址"))
+            discardCommandAttachments(raw)
             return
         }
         val requestId = command.optString("requestId", "").ifBlank { "req-${System.nanoTime()}" }
-        val page = getOrCreateAiPage(botId, targetUrl)
+        val page = try {
+            getOrCreateAiPage(botId, targetUrl)
+        } catch (error: Exception) {
+            notifyMainUi(errorJson(command, botId, error.message ?: "AI 网页地址无效"))
+            discardCommandAttachments(raw)
+            return
+        }
         if (page.inFlight?.requestId == requestId || page.queue.any { it.requestId == requestId }) return
-        page.loadFailure?.let { notifyMainUi(errorJson(command, botId, it)); return }
+        page.loadFailure?.let {
+            notifyMainUi(errorJson(command, botId, it))
+            discardCommandAttachments(raw)
+            return
+        }
         page.queue.addLast(PendingCommand(command.toString(), requestId, command.optString("groupId", "")))
         drainQueue(page)
     }
@@ -199,6 +403,8 @@ class MainActivity : ComponentActivity() {
         if (!page.ready || page.installingInjector || page.inFlight != null || page.queue.isEmpty()) return
         val task = page.queue.removeFirst()
         page.inFlight = task
+        page.activeAttachmentIds.clear()
+        page.activeAttachmentIds.addAll(attachmentIds(task.raw))
         val encoded = JSONObject.quote(task.raw)
         val script = "(function(){if(typeof window.__webHExecuteCommand!=='function')return 'NO_INJECTOR';window.__webHExecuteCommand(JSON.parse($encoded));return 'STARTED';})()"
         page.webView.evaluateJavascript(script) { result ->
@@ -207,6 +413,8 @@ class MainActivity : ComponentActivity() {
                 if (result == null || result.contains("NO_INJECTOR")) {
                     page.ready = false
                     page.inFlight = null
+                    page.activeAttachmentIds.clear()
+                    page.queue.addFirst(task)
                     installInjectorAgain(page)
                 }
             }
@@ -220,8 +428,9 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 if (aiPages[page.botId] !== page) return@runOnUiThread
                 page.installingInjector = false
-                page.ready = true
-                drainQueue(page)
+                page.ready = it?.trim() == "true"
+                if (page.ready) drainQueue(page)
+                else failPage(page, "网页连接脚本未能重新安装；请重新加载该聊天网页")
             }
         }
     }
@@ -233,8 +442,9 @@ class MainActivity : ComponentActivity() {
         val page = aiPages[botId]
         if (page != null && type in setOf("BOT_REPLY", "BOT_ERROR", "BOT_CANCELLED")) {
             val requestId = event.optString("requestId", "")
-            if (page.inFlight == null || requestId.isBlank() || page.inFlight?.requestId == requestId) {
+            if (page.inFlight?.requestId == requestId && requestId.isNotBlank()) {
                 page.inFlight = null
+                clearActiveAttachments(page)
                 drainQueue(page)
             }
         }
@@ -253,6 +463,7 @@ class MainActivity : ComponentActivity() {
                 if ((requestId.isBlank() || requestId == task.requestId) &&
                     (groupId.isBlank() || groupId == task.groupId)) {
                     notifyMainUi(cancelledJson(page.botId, task))
+                    discardCommandAttachments(task.raw)
                 } else {
                     page.queue.addLast(task)
                 }
@@ -263,6 +474,7 @@ class MainActivity : ComponentActivity() {
                 val encoded = JSONObject.quote(active.requestId)
                 page.webView.evaluateJavascript("window.__webHCancelCommand && window.__webHCancelCommand($encoded)", null)
                 page.inFlight = null
+                clearActiveAttachments(page)
                 notifyMainUi(cancelledJson(page.botId, active))
                 drainQueue(page)
             }
@@ -291,6 +503,7 @@ class MainActivity : ComponentActivity() {
         val task = page.inFlight ?: return
         page.inFlight = null
         notifyMainUi(errorJson(JSONObject(task.raw), page.botId, message))
+        clearActiveAttachments(page)
     }
 
     private fun failPage(page: AiPage, message: String) {
@@ -300,6 +513,7 @@ class MainActivity : ComponentActivity() {
         while (page.queue.isNotEmpty()) {
             val task = page.queue.removeFirst()
             notifyMainUi(errorJson(JSONObject(task.raw), page.botId, message))
+            discardCommandAttachments(task.raw)
         }
     }
 
@@ -315,6 +529,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showPage(botId: String, targetUrl: String, topPx: Int, heightPx: Int) {
+        if (normalizeUrl(targetUrl).isBlank()) {
+            notifyMainUi(errorJson(null, botId, "AI 网页地址必须是有效的 HTTPS 地址"))
+            return
+        }
         val page = getOrCreateAiPage(botId, targetUrl)
         activeVisibleBotId?.takeIf { it != botId }?.let { previousBotId ->
             aiPages[previousBotId]?.webView?.let { previousView ->
@@ -362,14 +580,20 @@ class MainActivity : ComponentActivity() {
                 val botId = command.optString("botId", "deepseek")
                 val target = command.optString("targetUrl", "")
                 if (target.isNotBlank()) {
+                    if (normalizeUrl(target).isBlank()) {
+                        notifyMainUi(errorJson(command, botId, "AI 网页地址必须是有效的 HTTPS 地址"))
+                        return
+                    }
                     val existing = aiPages[botId]
                     if (existing != null && normalizeUrl(existing.targetUrl) == normalizeUrl(target)) {
                         failInFlight(existing, "网页地址正在重新加载，当前请求已取消")
-                        existing.queue.clear()
+                        clearQueuedCommands(existing)
                         existing.ready = false
                         existing.loadFailure = null
                         existing.webView.loadUrl(target)
-                    } else getOrCreateAiPage(botId, target)
+                    } else {
+                        getOrCreateAiPage(botId, target)
+                    }
                 }
             }
             "EMERGENCY_STOP", "CANCEL_REQUEST" -> stopCommands(command)
@@ -379,7 +603,39 @@ class MainActivity : ComponentActivity() {
     inner class MainUiBridge {
         @JavascriptInterface
         fun postCommand(rawJson: String) {
-            runOnUiThread { handleCommandOnUi(rawJson) }
+            runOnUiThread {
+                try {
+                    handleCommandOnUi(rawJson)
+                } catch (error: Exception) {
+                    notifyMainUi(errorJson(runCatching { JSONObject(rawJson) }.getOrNull(), null, error.message ?: "Android 网页桥发生错误"))
+                    discardCommandAttachments(rawJson)
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun beginAttachmentUpload(id: String, size: Long): Boolean = this@MainActivity.beginAttachmentUpload(id, size)
+
+        @JavascriptInterface
+        fun writeAttachmentChunk(id: String, base64Chunk: String): Boolean = this@MainActivity.writeAttachmentChunk(id, base64Chunk)
+
+        @JavascriptInterface
+        fun finishAttachmentUpload(id: String): Boolean = this@MainActivity.finishAttachmentUpload(id)
+
+        @JavascriptInterface
+        fun discardAttachment(id: String): Boolean {
+            this@MainActivity.discardAttachment(id)
+            return true
+        }
+
+        @JavascriptInterface
+        fun readReplyAttachmentChunk(id: String, offset: Long, length: Int): String =
+            this@MainActivity.readStagedAttachmentChunk(id, offset, length)
+
+        @JavascriptInterface
+        fun discardReplyAttachment(id: String): Boolean {
+            this@MainActivity.discardAttachment(id)
+            return true
         }
     }
 
@@ -388,12 +644,31 @@ class MainActivity : ComponentActivity() {
         fun onBridgeEvent(rawJson: String) {
             runOnUiThread { handleBridgeEvent(rawJson) }
         }
+
+        @JavascriptInterface
+        fun readAttachmentChunk(id: String, offset: Long, length: Int): String = this@MainActivity.readAttachmentChunk(botId, id, offset, length)
+
+        @JavascriptInterface
+        fun beginReplyAttachmentUpload(id: String, size: Long): Boolean = this@MainActivity.beginAttachmentUpload(id, size)
+
+        @JavascriptInterface
+        fun writeReplyAttachmentChunk(id: String, base64Chunk: String): Boolean = this@MainActivity.writeAttachmentChunk(id, base64Chunk)
+
+        @JavascriptInterface
+        fun finishReplyAttachmentUpload(id: String): Boolean = this@MainActivity.finishAttachmentUpload(id)
+
+        @JavascriptInterface
+        fun discardReplyAttachmentUpload(id: String): Boolean {
+            this@MainActivity.discardAttachment(id)
+            return true
+        }
     }
 
     inner class AiPageWebViewClient(private val botId: String) : WebViewClient() {
         override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
             super.onPageStarted(view, url, favicon)
             aiPages[botId]?.takeIf { it.webView === view }?.apply {
+                failInFlight(this, "AI 网页正在重新加载；当前发送已取消")
                 ready = false
                 installingInjector = false
                 loadFailure = null
@@ -405,7 +680,10 @@ class MainActivity : ComponentActivity() {
             if (view != null && !url.isNullOrBlank()) onAiPageFinished(botId, view, url)
         }
 
-        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = false
+        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+            val uri = request?.url ?: return true
+            return uri.scheme != "https" || uri.host.isNullOrBlank() || !uri.userInfo.isNullOrBlank()
+        }
 
         override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
             super.onReceivedError(view, request, error)
@@ -438,9 +716,16 @@ class MainActivity : ComponentActivity() {
         ): Boolean {
             fileChooserCallback?.onReceiveValue(null)
             fileChooserCallback = filePathCallback
-            val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
-                addCategory(Intent.CATEGORY_OPENABLE)
-                type = "*/*"
+            val intent = try {
+                fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "*/*"
+                }
+            } catch (_: Exception) {
+                Intent(Intent.ACTION_GET_CONTENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "*/*"
+                }
             }
             return try {
                 startActivityForResult(Intent.createChooser(intent, "选择文件"), fileChooserRequestCode)
@@ -469,6 +754,8 @@ class MainActivity : ComponentActivity() {
             page.webView.destroy()
         }
         aiPages.clear()
+        attachmentUploadSessions.keys.toList().forEach(::discardAttachment)
+        stagedAttachmentFiles.keys.toList().forEach(::discardAttachment)
         if (::mainWebView.isInitialized) {
             mainWebView.stopLoading()
             mainWebView.destroy()

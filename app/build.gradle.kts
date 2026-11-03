@@ -22,8 +22,8 @@ android {
         applicationId = "com.webh.aiwechat.recovered"
         minSdk = 26
         targetSdk = 34
-        versionCode = 271
-        versionName = "2.7.1-recovered"
+        versionCode = 273
+        versionName = "2.7.3-fullscreen-media"
     }
 }
 
